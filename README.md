@@ -3,8 +3,8 @@
 This service solves the Jira reporting bottleneck by:
 - doing a **one-time full sync** of project issues,
 - then running **incremental sync** using `updated >= last_sync - lookback`,
-- storing issues + changelog locally in SQLite,
-- serving reports quickly from local DB (no repeated heavy Jira API scans).
+- storing issues + changelog locally in a JSON file,
+- serving reports quickly from local JSON cache (no repeated heavy Jira API scans).
 
 ## Setup
 
@@ -26,7 +26,7 @@ export PROJECT_KEY="ESM"
 Optional tuning:
 
 ```bash
-export DB_PATH="jira_cache.db"
+export DATA_PATH="jira_cache.json"
 export SYNC_PAGE_SIZE=100
 export SYNC_LOOKBACK_MINUTES=120
 ```
@@ -69,4 +69,4 @@ Returns JSON containing rows and breach summary.
 - Jira pagination is handled properly (`startAt` + `maxResults` + `total`).
 - We stop reloading all data every time.
 - We only fetch changed issues based on `updated` timestamp.
-- Local SQLite reads are very fast for monthly/audit reporting.
+- Local JSON cache reads are fast for monthly/audit reporting.

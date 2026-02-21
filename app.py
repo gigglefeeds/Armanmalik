@@ -1,7 +1,5 @@
 import json
 import os
-import sqlite3
-from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -16,7 +14,7 @@ JIRA_EMAIL = os.getenv("JIRA_EMAIL", "")
 JIRA_TOKEN = os.getenv("JIRA_TOKEN", "")
 JIRA_DOMAIN = os.getenv("JIRA_DOMAIN", "")
 PROJECT_KEY = os.getenv("PROJECT_KEY", "")
-DB_PATH = os.getenv("DB_PATH", "jira_cache.db")
+DATA_PATH = os.getenv("DATA_PATH", "jira_cache.json")
 SYNC_PAGE_SIZE = int(os.getenv("SYNC_PAGE_SIZE", "100"))
 SYNC_LOOKBACK_MINUTES = int(os.getenv("SYNC_LOOKBACK_MINUTES", "120"))
 
@@ -47,64 +45,30 @@ def jira_base_url() -> str:
     return f"https://{JIRA_DOMAIN}/rest/api/3"
 
 
-def init_db() -> None:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS issues (
-                issue_key TEXT PRIMARY KEY,
-                project_key TEXT,
-                created TEXT,
-                updated TEXT,
-                priority TEXT,
-                status TEXT,
-                summary TEXT,
-                reporter TEXT,
-                assignee TEXT,
-                complaint_time TEXT,
-                resolved_by TEXT,
-                channel TEXT,
-                customer_name TEXT,
-                resolution_friendly TEXT,
-                issue_json TEXT NOT NULL,
-                synced_at TEXT NOT NULL
-            )
-            """
-        )
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS changelog (
-                issue_key TEXT NOT NULL,
-                history_id TEXT NOT NULL,
-                created TEXT,
-                author TEXT,
-                items_json TEXT NOT NULL,
-                PRIMARY KEY(issue_key, history_id)
-            )
-            """
-        )
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sync_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                last_successful_sync TEXT
-            )
-            """
-        )
-        con.execute("INSERT OR IGNORE INTO sync_state (id, last_successful_sync) VALUES (1, NULL)")
-        con.commit()
+def load_store() -> Dict[str, Any]:
+    if not os.path.exists(DATA_PATH):
+        return {"sync_state": {"last_successful_sync": None}, "issues": {}, "changelog": {}}
+    with open(DATA_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data.setdefault("sync_state", {"last_successful_sync": None})
+    data.setdefault("issues", {})
+    data.setdefault("changelog", {})
+    return data
 
 
-def get_last_sync() -> Optional[str]:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        row = con.execute("SELECT last_successful_sync FROM sync_state WHERE id=1").fetchone()
-    return row[0] if row and row[0] else None
+def save_store(data: Dict[str, Any]) -> None:
+    temp_path = f"{DATA_PATH}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(temp_path, DATA_PATH)
 
 
-def set_last_sync(ts: str) -> None:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.execute("UPDATE sync_state SET last_successful_sync=? WHERE id=1", (ts,))
-        con.commit()
+def get_last_sync(data: Dict[str, Any]) -> Optional[str]:
+    return (data.get("sync_state") or {}).get("last_successful_sync")
+
+
+def set_last_sync(data: Dict[str, Any], ts: str) -> None:
+    data.setdefault("sync_state", {})["last_successful_sync"] = ts
 
 
 def parse_jira_time(value: Optional[str]) -> Optional[datetime]:
@@ -115,7 +79,10 @@ def parse_jira_time(value: Optional[str]) -> Optional[datetime]:
             return datetime.strptime(value, fmt)
         except ValueError:
             continue
-    return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def fmt_hhmm(delta_hours: float) -> str:
@@ -194,88 +161,50 @@ def fetch_issue_changelog(issue_key: str) -> List[Dict[str, Any]]:
     return all_histories
 
 
-def upsert_issue_and_changelog(issue: Dict[str, Any], histories: List[Dict[str, Any]]) -> None:
+def build_issue_record(issue: Dict[str, Any]) -> Dict[str, Any]:
     f = issue.get("fields", {})
-    row = (
-        issue.get("key"),
-        PROJECT_KEY,
-        f.get("created"),
-        f.get("updated"),
-        (f.get("priority") or {}).get("name", ""),
-        (f.get("status") or {}).get("name", ""),
-        f.get("summary", ""),
-        (f.get("reporter") or {}).get("displayName", ""),
-        (f.get("assignee") or {}).get("displayName", ""),
-        f.get("customfield_10941", ""),
-        (f.get("customfield_10336") or {}).get("displayName", ""),
-        (f.get("customfield_10334") or {}).get("value", ""),
-        f.get("customfield_10232", ""),
-        (f.get("customfield_10343") or {}).get("friendly", ""),
-        json.dumps(issue, ensure_ascii=False),
-        datetime.now(timezone.utc).isoformat(),
-    )
-
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.execute(
-            """
-            INSERT INTO issues (
-                issue_key, project_key, created, updated, priority, status, summary,
-                reporter, assignee, complaint_time, resolved_by, channel, customer_name,
-                resolution_friendly, issue_json, synced_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(issue_key) DO UPDATE SET
-                project_key=excluded.project_key,
-                created=excluded.created,
-                updated=excluded.updated,
-                priority=excluded.priority,
-                status=excluded.status,
-                summary=excluded.summary,
-                reporter=excluded.reporter,
-                assignee=excluded.assignee,
-                complaint_time=excluded.complaint_time,
-                resolved_by=excluded.resolved_by,
-                channel=excluded.channel,
-                customer_name=excluded.customer_name,
-                resolution_friendly=excluded.resolution_friendly,
-                issue_json=excluded.issue_json,
-                synced_at=excluded.synced_at
-            """,
-            row,
-        )
-
-        for h in histories:
-            con.execute(
-                """
-                INSERT INTO changelog(issue_key, history_id, created, author, items_json)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(issue_key, history_id) DO UPDATE SET
-                  created=excluded.created,
-                  author=excluded.author,
-                  items_json=excluded.items_json
-                """,
-                (
-                    issue.get("key"),
-                    str(h.get("id")),
-                    h.get("created"),
-                    (h.get("author") or {}).get("displayName", ""),
-                    json.dumps(h.get("items", []), ensure_ascii=False),
-                ),
-            )
-
-        con.commit()
+    return {
+        "issue_key": issue.get("key", ""),
+        "project_key": PROJECT_KEY,
+        "created": f.get("created", ""),
+        "updated": f.get("updated", ""),
+        "priority": (f.get("priority") or {}).get("name", ""),
+        "status": (f.get("status") or {}).get("name", ""),
+        "summary": f.get("summary", ""),
+        "reporter": (f.get("reporter") or {}).get("displayName", ""),
+        "assignee": (f.get("assignee") or {}).get("displayName", ""),
+        "complaint_time": f.get("customfield_10941", ""),
+        "resolved_by": (f.get("customfield_10336") or {}).get("displayName", ""),
+        "channel": (f.get("customfield_10334") or {}).get("value", ""),
+        "customer_name": f.get("customfield_10232", ""),
+        "resolution_friendly": (f.get("customfield_10343") or {}).get("friendly", ""),
+        "issue_json": issue,
+        "synced_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
-def compute_workflow_steps(issue_key: str) -> Dict[str, str]:
+def upsert_issue_and_changelog(data: Dict[str, Any], issue: Dict[str, Any], histories: List[Dict[str, Any]]) -> None:
+    issue_key = issue.get("key", "")
+    data.setdefault("issues", {})[issue_key] = build_issue_record(issue)
+
+    issue_changelog: Dict[str, Dict[str, Any]] = data.setdefault("changelog", {}).setdefault(issue_key, {})
+    for h in histories:
+        history_id = str(h.get("id", ""))
+        issue_changelog[history_id] = {
+            "created": h.get("created", ""),
+            "author": (h.get("author") or {}).get("displayName", ""),
+            "items": h.get("items", []),
+        }
+
+
+def compute_workflow_steps(data: Dict[str, Any], issue_key: str) -> Dict[str, str]:
     steps = {"pending": "", "pending_on_customer": "", "resolved": "", "pending_to_close": ""}
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        rows = con.execute(
-            "SELECT created, items_json FROM changelog WHERE issue_key=? ORDER BY created ASC",
-            (issue_key,),
-        ).fetchall()
+    logs = list((data.get("changelog") or {}).get(issue_key, {}).values())
+    logs.sort(key=lambda x: x.get("created", ""))
 
-    for created, items_json in rows:
-        items = json.loads(items_json or "[]")
-        for item in items:
+    for h in logs:
+        created = h.get("created", "")
+        for item in h.get("items", []):
             if (item.get("field") or "").lower() != "status":
                 continue
             to_val = (item.get("toString") or "").lower()
@@ -292,14 +221,14 @@ def compute_workflow_steps(issue_key: str) -> Dict[str, str]:
 
 
 def sync_now() -> Dict[str, Any]:
-    init_db()
+    data = load_store()
     now_utc = datetime.now(timezone.utc)
-    last_sync = get_last_sync()
+    last_sync = get_last_sync(data)
+
     if last_sync:
         last_dt = parse_jira_time(last_sync)
         if last_dt is None:
-            # isoformat from our DB
-            last_dt = datetime.fromisoformat(last_sync)
+            raise ValueError("Invalid last_successful_sync format in JSON store")
         start_dt = last_dt - timedelta(minutes=SYNC_LOOKBACK_MINUTES)
         updated_since = start_dt.strftime("%Y-%m-%d %H:%M")
     else:
@@ -309,13 +238,16 @@ def sync_now() -> Dict[str, Any]:
     for issue in issues:
         key = issue.get("key")
         histories = fetch_issue_changelog(key)
-        upsert_issue_and_changelog(issue, histories)
+        upsert_issue_and_changelog(data, issue, histories)
 
-    set_last_sync(now_utc.isoformat())
+    set_last_sync(data, now_utc.isoformat())
+    save_store(data)
+
     return {
         "synced_issues": len(issues),
         "last_sync": now_utc.isoformat(),
         "mode": "incremental" if last_sync else "full",
+        "data_file": DATA_PATH,
     }
 
 
@@ -330,55 +262,39 @@ def sync_endpoint():
 
 @app.route("/report", methods=["GET"])
 def report():
-    init_db()
+    data = load_store()
+
     start = request.args.get("from", "").strip()
     end = request.args.get("to", "").strip()
     ticket = request.args.get("ticket", "").strip().upper()
     priority_filter = request.args.get("priority", "").strip().lower()
     breach_type = request.args.get("breach_type", "").strip().lower()
 
-    where = ["1=1"]
-    params: List[Any] = []
-
-    if ticket:
-        where.append("issue_key = ?")
-        params.append(ticket)
-    if start:
-        where.append("date(created) >= date(?)")
-        params.append(start)
-    if end:
-        where.append("date(created) <= date(?)")
-        params.append(end)
-    if priority_filter:
-        where.append("lower(priority) = ?")
-        params.append(priority_filter)
-
-    query = f"SELECT issue_key, summary, created, reporter, assignee, priority, status, resolved_by, channel, customer_name, complaint_time, resolution_friendly FROM issues WHERE {' AND '.join(where)} ORDER BY created ASC"
-
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        rows = con.execute(query, params).fetchall()
+    all_issues = list((data.get("issues") or {}).values())
+    all_issues.sort(key=lambda x: x.get("created", ""))
 
     result_rows = []
     total_response_breach = 0
 
-    for row in rows:
-        (
-            issue_key,
-            summary,
-            created,
-            reporter,
-            assignee,
-            priority,
-            status,
-            resolved_by,
-            channel,
-            customer_name,
-            complaint_time,
-            resolution_friendly,
-        ) = row
+    for rec in all_issues:
+        issue_key = rec.get("issue_key", "")
+        if ticket and issue_key != ticket:
+            continue
 
+        created = rec.get("created", "")
         created_dt = parse_jira_time(created)
+        if start and created_dt and created_dt.date() < datetime.strptime(start, "%Y-%m-%d").date():
+            continue
+        if end and created_dt and created_dt.date() > datetime.strptime(end, "%Y-%m-%d").date():
+            continue
+
+        priority = rec.get("priority", "")
+        if priority_filter and priority.lower() != priority_filter:
+            continue
+
+        complaint_time = rec.get("complaint_time", "")
         complaint_dt = parse_jira_time(complaint_time)
+
         response_hours = ""
         response_breach = ""
         if created_dt and complaint_dt:
@@ -392,25 +308,25 @@ def report():
         if response_breach == "Yes":
             total_response_breach += 1
 
-        steps = compute_workflow_steps(issue_key)
+        steps = compute_workflow_steps(data, issue_key)
         result_rows.append(
             {
                 "key": issue_key,
-                "summary": summary,
+                "summary": rec.get("summary", ""),
                 "created": created,
-                "reporter": reporter,
-                "assignee": assignee,
+                "reporter": rec.get("reporter", ""),
+                "assignee": rec.get("assignee", ""),
                 "priority": priority,
-                "status": status,
-                "resolved_by": resolved_by,
-                "channel": channel,
-                "customer_name": customer_name,
+                "status": rec.get("status", ""),
+                "resolved_by": rec.get("resolved_by", ""),
+                "channel": rec.get("channel", ""),
+                "customer_name": rec.get("customer_name", ""),
                 "complaint_time": complaint_time,
                 "response_time": response_hours,
                 "response_breach": response_breach,
                 "assigned_response_sla": get_allowed_response_hours(priority or ""),
                 "resolution_sla_hours": get_assigned_resolution_sla(priority or ""),
-                "resolution_time": resolution_friendly,
+                "resolution_time": rec.get("resolution_friendly", ""),
                 "pending": steps["pending"],
                 "pending_on_customer": steps["pending_on_customer"],
                 "resolved": steps["resolved"],
@@ -423,10 +339,10 @@ def report():
             "count": len(result_rows),
             "breach_summary": {"response_breach": total_response_breach},
             "rows": result_rows,
+            "data_file": DATA_PATH,
         }
     )
 
 
 if __name__ == "__main__":
-    init_db()
     app.run(host="0.0.0.0", port=5000, debug=True)
